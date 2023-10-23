@@ -1,4 +1,6 @@
-use crate::bit_io::BitReader;
+use crate::{bit_io::BitReader, lzss::EncBuffer};
+use bitstream_io::{BitWrite, BitWriter};
+use std::collections::HashMap;
 use std::{collections::BTreeMap, io};
 
 // Type should be `[u8; 288]` if `.concat()` could be used in `const` contexts
@@ -17,6 +19,7 @@ pub struct HuffmanTree {
     /// The Huffman tree, encoded as an array-based heap.
     /// The root node is at index 1, and children are at 2n and 2n+1.
     tree: Vec<Option<u16>>,
+    symbol_to_code: [[u16; 2]; 288], // [symbol][code, code_len]
 }
 
 impl HuffmanTree {
@@ -46,6 +49,7 @@ impl HuffmanTree {
         }
 
         let mut tree = vec![None; 1 << (largest_code_length + 1)];
+        let mut symbol_to_code = [[0; 2]; 288];
         for (symbol, &code_len) in code_lengths.iter().enumerate() {
             if code_len == 0 {
                 continue;
@@ -57,11 +61,15 @@ impl HuffmanTree {
             let heap_index = compute_heap_index(code, code_len);
             let heap_symbol: u16 = symbol.try_into().unwrap();
             tree[heap_index] = Some(heap_symbol);
+            symbol_to_code[symbol] = [code.try_into().unwrap(), code_len.try_into().unwrap()];
 
             next_code[code_len] += 1;
         }
 
-        Self { tree }
+        Self {
+            tree,
+            symbol_to_code,
+        }
     }
 
     pub fn fixed_literal() -> Self {
@@ -105,6 +113,28 @@ impl HuffmanTree {
                 return Ok(symbol);
             }
         }
+    }
+
+    pub fn encode<W, E>(
+        &self,
+        encoder: &mut EncBuffer,
+        out: &mut BitWriter<W, E>,
+        symbol: u16,
+    ) -> io::Result<usize>
+    where
+        W: io::Write,
+        E: bitstream_io::Endianness,
+    {
+        let mut index = 1;
+        let mut length: u16 = 0;
+        let code = self.symbol_to_code[usize::from(symbol)][0];
+        let code_len = self.symbol_to_code[usize::from(symbol)][1];
+        while length < code_len {
+            let bit: bool = (code >> length) % 2 == 1;
+            encoder.push_bit(out, bit);
+            length += 1;
+        }
+        Ok(0)
     }
 
     pub fn decode_code_lengths<R>(

@@ -1,8 +1,17 @@
+use bitstream_io::{BitWrite, BitWriter};
 use std::collections::VecDeque;
+use std::io;
+use std::io::Read;
+
+use anyhow::Ok;
+
+use crate::huffman::HuffmanTree;
 
 const MAX_DISTANCE_BYTES: usize = 32768;
+const MAX_BYTES_PER_BLOCK: usize = u16::MAX as usize;
+const MAX_BLOCKS: usize = 1;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Symbol {
     /// A literal byte
     Literal(u8),
@@ -15,6 +24,152 @@ pub enum Symbol {
         length_minus_three: u8,
         distance_minus_one: u16,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EncodeStage {
+    NewBlock,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LzssEncoder {
+    stage: EncodeStage,
+    pub in_buffer: [[u8; MAX_BYTES_PER_BLOCK]; MAX_BLOCKS],
+    pub encoded_buf: [[Symbol; MAX_BYTES_PER_BLOCK]; MAX_BLOCKS],
+    pub in_len: [usize; MAX_BLOCKS],
+    pub enc_len: [usize; MAX_BLOCKS],
+    pub total_blocks: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LzssDecoder {
+    stage: EncodeStage,
+    pub encoded_buf: [[Symbol; MAX_DISTANCE_BYTES]; MAX_BLOCKS],
+    pub out_buf: [[u8; MAX_DISTANCE_BYTES]; MAX_BLOCKS],
+    pub enc_len: [usize; MAX_BLOCKS],
+    pub out_len: [usize; MAX_BLOCKS],
+    pub total_blocks: usize,
+}
+
+impl LzssEncoder {
+    pub fn new() -> Self {
+        Self {
+            stage: EncodeStage::NewBlock,
+            in_buffer: [[0u8; MAX_BYTES_PER_BLOCK]; MAX_BLOCKS],
+            encoded_buf: [[Symbol::Literal(0); MAX_BYTES_PER_BLOCK]; MAX_BLOCKS],
+            in_len: [0; MAX_BLOCKS],
+            enc_len: [0; MAX_BLOCKS],
+            total_blocks: 0,
+        }
+    }
+
+    fn find_longest_prefix_or_literal(
+        &mut self,
+        curr_position: usize,
+        curr_block: usize,
+    ) -> Symbol {
+        if curr_position == self.in_len[curr_block] {
+            return Symbol::EndOfBlock;
+        }
+
+        let mut long_prefix: Symbol = Symbol::Literal(self.in_buffer[curr_block][curr_position]);
+        for position in 0..curr_position {
+            let mut curr_matching_length = 0;
+            while curr_position + curr_matching_length < self.in_len[curr_block]
+                && self.in_buffer[curr_block][curr_position + curr_matching_length]
+                    == self.in_buffer[curr_block][position as usize + curr_matching_length as usize]
+                && curr_matching_length < 258
+            {
+                curr_matching_length += 1;
+            }
+            if curr_matching_length >= 3 {
+                match long_prefix {
+                    Symbol::Literal(_) => {
+                        long_prefix = Symbol::BackReference {
+                            length_minus_three: (curr_matching_length - 3) as u8,
+                            distance_minus_one: (curr_position - position - 1) as u16,
+                        };
+                    }
+                    Symbol::BackReference {
+                        length_minus_three,
+                        distance_minus_one: _,
+                    } => {
+                        if curr_matching_length > length_minus_three as usize + 3 {
+                            long_prefix = Symbol::BackReference {
+                                length_minus_three: (curr_matching_length - 3) as u8,
+                                distance_minus_one: (curr_position - position - 1) as u16,
+                            };
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+
+        long_prefix
+    }
+
+    fn advance_stage(&mut self, curr_block: usize) -> io::Result<()> {
+        match self.stage {
+            EncodeStage::NewBlock => {
+                let mut curr_position: usize = 0;
+                loop {
+                    match self.find_longest_prefix_or_literal(curr_position, curr_block) {
+                        Symbol::Literal(b) => {
+                            self.encoded_buf[curr_block][self.enc_len[curr_block]] =
+                                Symbol::Literal(b);
+                            self.enc_len[curr_block] += 1;
+                            curr_position += 1;
+                        }
+                        Symbol::BackReference {
+                            length_minus_three,
+                            distance_minus_one,
+                        } => {
+                            self.encoded_buf[curr_block][self.enc_len[curr_block]] =
+                                Symbol::BackReference {
+                                    length_minus_three,
+                                    distance_minus_one,
+                                };
+                            self.enc_len[curr_block] += 1;
+                            curr_position += length_minus_three as usize + 3;
+                        }
+                        Symbol::EndOfBlock => {
+                            self.encoded_buf[curr_block][self.enc_len[curr_block]] =
+                                Symbol::EndOfBlock;
+                            self.enc_len[curr_block] += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            EncodeStage::Complete => {}
+        }
+        //out.write_all(&self.in_buffer[..self.in_len])?;
+        //out.write_all(&self.encoded_buf[..self.enc_len])?;
+        io::Result::Ok(())
+    }
+
+    pub fn encode(&mut self, curr_block: usize) -> io::Result<()> {
+        self.advance_stage(curr_block)?;
+        self.total_blocks += 1;
+
+        io::Result::Ok(())
+    }
+}
+
+impl LzssDecoder {
+    pub fn new() -> Self {
+        Self {
+            stage: EncodeStage::NewBlock,
+            encoded_buf: [[Symbol::Literal(0); MAX_DISTANCE_BYTES]; MAX_BLOCKS],
+            out_buf: [[0u8; MAX_DISTANCE_BYTES]; MAX_BLOCKS],
+            enc_len: [0; MAX_BLOCKS],
+            out_len: [0; MAX_BLOCKS],
+            total_blocks: 0,
+        }
+    }
+    //TODO Implement decoder
 }
 
 impl Symbol {
@@ -38,6 +193,20 @@ impl Symbol {
             }
             255 => 28,
         })
+    }
+
+    pub fn back_reference_length_get_extra_bits(length_minus_three: u8) -> u8 {
+        match length_minus_three {
+            0..=7 => 0,
+            8..=254 => {
+                let log2: u8 = length_minus_three.ilog2().try_into().unwrap();
+                let code = 4 * (log2 - 1) + (length_minus_three >> (log2 - 2) & 0b11);
+                let min_val_with_code = ((code - 4 * (log2 - 1)) << (log2 - 2))
+                    + ((length_minus_three >> log2) << log2);
+                length_minus_three - min_val_with_code
+            }
+            255 => 0,
+        }
     }
 
     pub fn back_reference_length_extra_bits(length_minus_three: u8) -> u8 {
@@ -86,6 +255,44 @@ impl OutBuffer {
 
     pub fn get(&self, distance_minus_one: usize) -> Option<u8> {
         Some(*self.0.get(distance_minus_one)?)
+    }
+}
+
+#[derive(Debug)]
+pub struct EncBuffer();
+
+impl EncBuffer {
+    pub fn new() -> Self {
+        Self()
+    }
+
+    pub fn push_bit<W, E>(&mut self, out: &mut BitWriter<W, E>, bit: bool) -> io::Result<()>
+    where
+        W: io::Write,
+        E: bitstream_io::Endianness,
+    {
+        out.write_bit(bit)?;
+        io::Result::Ok(())
+    }
+
+    pub fn push_bits<W, E>(&mut self, out: &mut BitWriter<W, E>, bits: &[u8]) -> io::Result<()>
+    where
+        W: io::Write,
+        E: bitstream_io::Endianness,
+    {
+        for bit in bits {
+            self.push_bit(out, *bit != 0)?;
+        }
+        io::Result::Ok(())
+    }
+
+    pub fn push_bytes<W, E>(&mut self, out: &mut BitWriter<W, E>, bytes: &[u8]) -> io::Result<()>
+    where
+        W: io::Write,
+        E: bitstream_io::Endianness,
+    {
+        out.write_bytes(bytes)?;
+        io::Result::Ok(())
     }
 }
 
@@ -195,5 +402,65 @@ mod tests {
         }
 
         assert_eq!(expected_distances_by_code(), actual_distances_by_code);
+    }
+
+    #[test]
+    fn test_lzss() {
+        let mut encoder = LzssEncoder::new();
+        let mut is_eof = false;
+
+        loop {
+            loop {
+                let in_ = &mut io::stdin().lock();
+                match in_.read(
+                    &mut encoder.in_buffer[encoder.total_blocks]
+                        [encoder.in_len[encoder.total_blocks]..],
+                ) {
+                    std::result::Result::Ok(0) => {
+                        print!("EOF\n");
+                        is_eof = true;
+                        break;
+                    }
+                    std::result::Result::Ok(n) => {
+                        print!("READ {} BYTES\n", n);
+                        encoder.in_len[encoder.total_blocks] += n;
+                        if encoder.in_len[encoder.total_blocks] == MAX_BYTES_PER_BLOCK {
+                            break;
+                        }
+                    }
+                    Err(e) if matches!(e.kind(), io::ErrorKind::Interrupted) => continue,
+                    Err(_) => panic!(),
+                }
+                let _ = encoder.encode(encoder.total_blocks);
+            }
+
+            let mut tot_in_length = 0;
+            let mut tot_enc_length = 0;
+            for i in 0..encoder.total_blocks {
+                print!(
+                    "BLOCK {}: {:?}\n",
+                    i,
+                    &encoder.in_buffer[i][..encoder.in_len[i]]
+                );
+                tot_in_length += encoder.in_len[i];
+            }
+            print!("####################\n");
+            for i in 0..encoder.total_blocks {
+                print!(
+                    "ENCODED BLOCK {}: {:?}\n",
+                    i,
+                    &encoder.encoded_buf[i][..encoder.enc_len[i]]
+                );
+                tot_enc_length += encoder.enc_len[i];
+            }
+            print!("####################\n");
+            print!("TOTAL INPUT LENGTH: {}\n", tot_in_length);
+            print!("TOTAL ENCODED LENGTH: {}\n", tot_enc_length);
+
+            if is_eof {
+                encoder.stage = EncodeStage::Complete;
+                break;
+            }
+        }
     }
 }

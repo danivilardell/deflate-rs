@@ -1,13 +1,15 @@
+use crate::lzss;
 use crate::{
     bit_io::BitReader,
     huffman::{DistanceEncoding, HuffmanTree},
-    lzss::{OutBuffer, Symbol},
+    lzss::{EncBuffer, LzssEncoder, OutBuffer, Symbol},
 };
+use bitstream_io::{BigEndian, BitWriter};
 use bitvec::prelude::*;
 use std::io;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeflateEncoding {
+pub enum DeflateEncoding {
     NoCompression,
     FixedHuffman,
     DynamicHuffman,
@@ -286,20 +288,28 @@ impl DeflateDecoder {
 }
 
 #[derive(Debug)]
-enum EncodeStage {
-    NewBlock,
+pub enum EncodeStage {
+    NewBlock {
+        is_final: bool,
+        encoding: DeflateEncoding,
+    },
+    ParsedMode {
+        encoding: DeflateEncoding,
+    },
     Complete,
 }
 
 #[derive(Debug)]
 pub struct DeflateEncoder {
-    stage: EncodeStage,
+    pub enc_buffer: EncBuffer,
+    pub stage: EncodeStage,
 }
 
 impl DeflateEncoder {
-    pub fn new() -> Self {
+    pub fn new(is_final: bool, encoding: DeflateEncoding) -> Self {
         Self {
-            stage: EncodeStage::NewBlock,
+            enc_buffer: EncBuffer::new(),
+            stage: EncodeStage::NewBlock { is_final, encoding },
         }
     }
 
@@ -308,22 +318,44 @@ impl DeflateEncoder {
         R: io::Read,
         W: io::Write,
     {
+        let bit_writer = &mut BitWriter::new(out);
         match self.stage {
-            EncodeStage::NewBlock => {
+            EncodeStage::NewBlock { is_final, encoding } => {
+                self.enc_buffer
+                    .push_bit::<_, BigEndian>(bit_writer, is_final)?;
+                match encoding {
+                    DeflateEncoding::NoCompression => {
+                        self.enc_buffer
+                            .push_bits::<_, BigEndian>(bit_writer, &[0, 0])?;
+                        self.enc_buffer
+                            .push_bits::<_, BigEndian>(bit_writer, &[0; 5])?; //padding
+                    }
+                    DeflateEncoding::FixedHuffman => {
+                        self.enc_buffer
+                            .push_bits::<_, BigEndian>(bit_writer, &[0, 1])?;
+                    }
+                    DeflateEncoding::DynamicHuffman => {
+                        self.enc_buffer
+                            .push_bits::<_, BigEndian>(bit_writer, &[1, 0])?;
+                    }
+                }
+                self.stage = EncodeStage::ParsedMode { encoding };
+                Ok(())
+            }
+            EncodeStage::ParsedMode { encoding } => {
                 const MAX_BYTES_PER_BLOCK: usize = u16::MAX as usize;
-                let mut buf = [0u8; MAX_BYTES_PER_BLOCK];
-                let mut len = 0;
+                let mut lzss_encoder = LzssEncoder::new();
                 let mut is_eof = false;
 
                 loop {
-                    match in_.read(&mut buf[len..]) {
+                    match in_.read(&mut lzss_encoder.in_buffer[0][lzss_encoder.in_len[0]..]) {
                         Ok(0) => {
                             is_eof = true;
                             break;
                         }
                         Ok(n) => {
-                            len += n;
-                            if len == MAX_BYTES_PER_BLOCK {
+                            lzss_encoder.in_len[0] += n;
+                            if lzss_encoder.in_len[0] == MAX_BYTES_PER_BLOCK {
                                 break;
                             }
                         }
@@ -332,30 +364,79 @@ impl DeflateEncoder {
                     }
                 }
 
-                let mut header_bits = bitvec![u8, Lsb0; 0; 0];
-                header_bits.push(is_eof);
+                match encoding {
+                    DeflateEncoding::NoCompression => {
+                        self.enc_buffer.push_bytes(
+                            bit_writer,
+                            &lzss_encoder.in_buffer[0][..lzss_encoder.in_len[0]],
+                        )?;
+                    }
+                    DeflateEncoding::FixedHuffman => {
+                        let _ = lzss_encoder.encode(lzss_encoder.total_blocks);
+                        let encoded_buf = lzss_encoder.encoded_buf;
 
-                let encoding_bits = BitVec::from(DeflateEncoding::NoCompression);
-                header_bits.extend_from_bitslice(encoding_bits.as_bitslice());
+                        let literal_huffman_tree = HuffmanTree::fixed_literal();
 
-                // Pad bits to a full byte
-                header_bits.resize(8, false);
+                        for block in &encoded_buf {
+                            for symbol in block {
+                                match symbol {
+                                    Symbol::Literal(byte) => {
+                                        literal_huffman_tree.encode(
+                                            &mut self.enc_buffer,
+                                            bit_writer,
+                                            *byte as u16,
+                                        )?;
+                                    }
+                                    Symbol::BackReference {
+                                        length_minus_three,
+                                        distance_minus_one,
+                                    } => {
+                                        literal_huffman_tree.encode(
+                                            &mut self.enc_buffer,
+                                            bit_writer,
+                                            lzss::Symbol::back_reference_length_code(
+                                                *length_minus_three,
+                                            ),
+                                        )?;
+                                        let length_extra_bits = lzss::Symbol::back_reference_length_get_extra_bits(
+                                            *length_minus_three,
+                                        );
+                                        let length_length_extra_bits = lzss::Symbol::back_reference_length_extra_bits(
+                                            *length_minus_three,
+                                        );
+                                        for i in 0..length_length_extra_bits {
+                                            let bit = (length_extra_bits >> (length_length_extra_bits - i)) & 1 == 1;
+                                            self.enc_buffer.push_bit(bit_writer, bit)?;
+                                        }
+                                        for i in 0..5 {
+                                            let bit = (distance_minus_one >> (4 - i)) & 1 == 1;
+                                            self.enc_buffer.push_bit(bit_writer, bit)?;
+                                        }
+                                    }
+                                    Symbol::EndOfBlock => {
+                                        literal_huffman_tree.encode(
+                                            &mut self.enc_buffer,
+                                            bit_writer,
+                                            256 as u16,
+                                        )?;
+                                        break;
+                                    }
+                                }
 
-                io::copy(&mut header_bits, out)?;
-
-                // `.unwrap()` is safe because `len <= u16::MAX`
-                let len_header: u16 = len.try_into().unwrap();
-                let nlen_header = !len_header;
-
-                out.write_all(&len_header.to_le_bytes())?;
-                out.write_all(&nlen_header.to_le_bytes())?;
-                out.write_all(&buf[..len])?;
+                                if let Symbol::EndOfBlock = symbol {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    DeflateEncoding::DynamicHuffman => {}
+                }
 
                 if is_eof {
-                    out.flush()?;
                     self.stage = EncodeStage::Complete;
                 }
 
+                bit_writer.flush()?;
                 Ok(())
             }
             EncodeStage::Complete => Ok(()),
@@ -372,5 +453,22 @@ impl DeflateEncoder {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nocompression_encode() {
+        let mut encoder = DeflateEncoder::new(true, DeflateEncoding::NoCompression);
+        let _ = encoder.encode(&mut io::stdin().lock(), &mut io::stdout().lock());
+    }
+
+    #[test]
+    fn test_compression_fixed_huffman_encode() {
+        let mut encoder = DeflateEncoder::new(true, DeflateEncoding::FixedHuffman);
+        let _ = encoder.encode(&mut io::stdin().lock(), &mut io::stdout().lock());
     }
 }

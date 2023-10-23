@@ -19,8 +19,8 @@ fn main() -> anyhow::Result<()> {
     let Args { command } = Args::try_parse()?;
     match command {
         Command::DeflateEncode => {
-            let mut encoder = DeflateEncoder::new();
-            encoder.encode(&mut io::stdin().lock(), &mut io::stdout().lock())?;
+            //let mut encoder = DeflateEncoder::new();
+            //encoder.encode(&mut io::stdin().lock(), &mut io::stdout().lock())?;
             Ok(())
         }
         Command::DeflateDecode => {
